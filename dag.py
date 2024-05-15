@@ -96,6 +96,12 @@ def fetch_chunk(chunk, connection):
             soi.sgst_tax_amount,
             soi.igst_tax_amount,
             soi.is_dc,
+            (
+                CASE
+                    WHEN soi.saleable_type LIKE "%CustomizedBook" THEN 1
+                    ELSE 0
+                END
+            ) as is_customized,
             
             /* sale order details */
             so.id AS sale_order_id,
@@ -299,7 +305,7 @@ def data_transform(df):
             'saleable_type', 'saleable_id', 'sale_order_item_discount_percentage',
             'sale_order_item_mrp', 'unit_price_with_tax', 'unit_price_without_tax',
             'cgst_tax_rate', 'sgst_tax_rate', 'igst_tax_rate', 'cgst_tax_amount',
-            'sgst_tax_amount', 'igst_tax_amount', 'is_dc', 'sale_order_id',
+            'sgst_tax_amount', 'igst_tax_amount', 'is_dc', 'is_customized', 'sale_order_id',
             'sale_order_date', 'sale_order_net_total', 'sales_channel',
             'order_state', 'title_name', 'edition_name', 'ref_code',
             'master_title_type', 'master_title_sub_type', 'meta_data',
@@ -324,12 +330,12 @@ def load_data(df, connection):
         row = df.iloc[i]
         row = row.apply(lambda x: x.item() if isinstance(x, np.generic) else x)
         row = row.replace({np.nan: None})
-        query = f"""insert into {table} (sale_order_item_id,itemParentable_type,itemParentable_id,saleable_type,saleable_id,sale_order_item_discount_percentage,sale_order_item_mrp,unit_price_with_tax,unit_price_without_tax,cgst_tax_rate,sgst_tax_rate,igst_tax_rate,cgst_tax_amount,sgst_tax_amount,igst_tax_amount,is_dc,sale_order_id,sale_order_date,sale_order_net_total,sales_channel,order_state,title_name,edition_name,ref_code,master_title_type,master_title_sub_type,meta_data,invoice_item_id,quantity,ii_quantity,final_ii_quantity,is_both_invoiced,is_partially_invoiced,non_invoiced_quantity,invoice_item_is_bill,invoice_item_is_dc,is_invoiced,invoice_id,invoice_prefix,invoice_is_bill,invoice_cr_dr_state,invoice_state,invoice_round_off,invoice_date,invoice_total_with_tax,total_unit_price_without_tax,advance_amount,cash_amount,cheque_amount,online_amount,contactable_type,sales_group_id,sales_group_name,rsm,contactable_id,customer_name,customer_category,branch_id,branch_name,address_city,address_pincode,address_state,packed_2_delivered_tat_day,create_2_processing_tat_day,processing_2_complete_tat_day,fetch_date) 
-            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        query = f"""insert into {table} (sale_order_item_id,itemParentable_type,itemParentable_id,saleable_type,saleable_id,sale_order_item_discount_percentage,sale_order_item_mrp,unit_price_with_tax,unit_price_without_tax,cgst_tax_rate,sgst_tax_rate,igst_tax_rate,cgst_tax_amount,sgst_tax_amount,igst_tax_amount,is_dc,is_customized,sale_order_id,sale_order_date,sale_order_net_total,sales_channel,order_state,title_name,edition_name,ref_code,master_title_type,master_title_sub_type,meta_data,invoice_item_id,quantity,ii_quantity,final_ii_quantity,is_both_invoiced,is_partially_invoiced,non_invoiced_quantity,invoice_item_is_bill,invoice_item_is_dc,is_invoiced,invoice_id,invoice_prefix,invoice_is_bill,invoice_cr_dr_state,invoice_state,invoice_round_off,invoice_date,invoice_total_with_tax,total_unit_price_without_tax,advance_amount,cash_amount,cheque_amount,online_amount,contactable_type,sales_group_id,sales_group_name,rsm,contactable_id,customer_name,customer_category,branch_id,branch_name,address_city,address_pincode,address_state,packed_2_delivered_tat_day,create_2_processing_tat_day,processing_2_complete_tat_day,fetch_date) 
+            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """
         mycursor.execute(query, 
             (
-                row['sale_order_item_id'], row['itemParentable_type'], row['itemParentable_id'], row['saleable_type'], row['saleable_id'], row['sale_order_item_discount_percentage'], row['sale_order_item_mrp'], row['unit_price_with_tax'], row['unit_price_without_tax'], row['cgst_tax_rate'], row['sgst_tax_rate'], row['igst_tax_rate'], row['cgst_tax_amount'], row['sgst_tax_amount'], row['igst_tax_amount'], row['is_dc'], row['sale_order_id'], row['sale_order_date'], row['sale_order_net_total'], row['sales_channel'], row['order_state'], row['title_name'], row['edition_name'], row['ref_code'], row['master_title_type'], row['master_title_sub_type'], row['meta_data'], row['invoice_item_id'], row['quantity'], row['ii_quantity'], row['final_ii_quantity'], row['is_both_invoiced'], row['is_partially_invoiced'], row['non_invoiced_quantity'], row['invoice_item_is_bill'], row['invoice_item_is_dc'], row['is_invoiced'], row['invoice_id'], row['invoice_prefix'], row['invoice_is_bill'], row['invoice_cr_dr_state'], row['invoice_state'], row['invoice_round_off'], row['invoice_date'], row['invoice_total_with_tax'], row['total_unit_price_without_tax'], row['advance_amount'], row['cash_amount'], row['cheque_amount'], row['online_amount'], row['contactable_type'], row['sales_group_id'], row['sales_group_name'], row['rsm'], row['contactable_id'], row['customer_name'], row['customer_category'], row['branch_id'], row['branch_name'], row['address_city'], row['address_pincode'], row['address_state'], row['packed_2_delivered_tat_day'], row['create_2_processing_tat_day'], row['processing_2_complete_tat_day'], row['fetch_date']
+                row['sale_order_item_id'], row['itemParentable_type'], row['itemParentable_id'], row['saleable_type'], row['saleable_id'], row['sale_order_item_discount_percentage'], row['sale_order_item_mrp'], row['unit_price_with_tax'], row['unit_price_without_tax'], row['cgst_tax_rate'], row['sgst_tax_rate'], row['igst_tax_rate'], row['cgst_tax_amount'], row['sgst_tax_amount'], row['igst_tax_amount'], row['is_dc'], row['is_customized'], row['sale_order_id'], row['sale_order_date'], row['sale_order_net_total'], row['sales_channel'], row['order_state'], row['title_name'], row['edition_name'], row['ref_code'], row['master_title_type'], row['master_title_sub_type'], row['meta_data'], row['invoice_item_id'], row['quantity'], row['ii_quantity'], row['final_ii_quantity'], row['is_both_invoiced'], row['is_partially_invoiced'], row['non_invoiced_quantity'], row['invoice_item_is_bill'], row['invoice_item_is_dc'], row['is_invoiced'], row['invoice_id'], row['invoice_prefix'], row['invoice_is_bill'], row['invoice_cr_dr_state'], row['invoice_state'], row['invoice_round_off'], row['invoice_date'], row['invoice_total_with_tax'], row['total_unit_price_without_tax'], row['advance_amount'], row['cash_amount'], row['cheque_amount'], row['online_amount'], row['contactable_type'], row['sales_group_id'], row['sales_group_name'], row['rsm'], row['contactable_id'], row['customer_name'], row['customer_category'], row['branch_id'], row['branch_name'], row['address_city'], row['address_pincode'], row['address_state'], row['packed_2_delivered_tat_day'], row['create_2_processing_tat_day'], row['processing_2_complete_tat_day'], row['fetch_date']
             )
         )
     #     if load_counter >= load_chunk_size :
