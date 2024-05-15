@@ -4,29 +4,53 @@ import logging
 
 import pandas as pd
 import numpy as np
-import mysql.connector
-import configparser
-import warnings
-warnings.filterwarnings("ignore")
 import time
 import math
+import warnings
+warnings.filterwarnings("ignore")
+
+import concurrent.futures
+import mysql.connector
+import configparser
+import mysql.connector.pooling
 
 conf = configparser.ConfigParser()
+conf_state = configparser.ConfigParser()
 conf.read(r"./configure.yaml")
+conf_state.read(r"./db_state.yaml")
 
-SOURCE_CONNECTION = mysql.connector.connect(
-    host = conf.get("source", "host"),
-    user = conf.get("source", "username"),
-    password = conf.get("source", "password"),
-    database = conf.get("source", "database")
-)
+# SOURCE_CONNECTION_LOCAL = mysql.connector.connect(
+#     host = conf.get("source", "_host"),
+#     user = conf.get("source", "_username"),
+#     password = conf.get("source", "_password"),
+#     database = conf.get("source", "_database")
+# )
 
-DESTINATION_CONNECTION = mysql.connector.connect(
-    host = conf.get("destination", "host"),
-    user = conf.get("destination", "username"),
-    password = conf.get("destination", "password"),
-    database = conf.get("destination", "database")
-)
+# DESTINATION_CONNECTION_LOCAL = mysql.connector.connect(
+#     host = conf.get("destination", "_host"),
+#     user = conf.get("destination", "_username"),
+#     password = conf.get("destination", "_password"),
+#     database = conf.get("destination", "_database")
+# )
+
+THREAD_COUNT = int(conf.get("app", "thread_count"))
+
+dbconfig_destination_local = {
+            "host" : conf.get("destination", "_host"),
+            "user" : conf.get("destination", "_username"),
+            "password" : conf.get("destination", "_password"),
+            "database" : conf.get("destination", "_database")
+    }
+
+dbconfig_source_local = {
+            "host" : conf.get("source", "host"),
+            "user" : conf.get("source", "username"),
+            "password" : conf.get("source", "password"),
+            "database" : conf.get("source", "database")
+    }
+
+connection_pool_destination = mysql.connector.pooling.MySQLConnectionPool(pool_name="mypool", pool_size=6, **dbconfig_destination_local)
+connection_pool_source = mysql.connector.pooling.MySQLConnectionPool(pool_name="mypool", pool_size=6, **dbconfig_source_local)
 
 table = conf.get("destination", "table")
 
@@ -41,13 +65,18 @@ logging.basicConfig(
     filename='./airflow_logs.log'
 )
 
-def delete_chunk(chunk):
-    cursor = DESTINATION_CONNECTION.cursor()
+def get_pool_connections(pool):
+    active_connections = sum(1 for conn in pool._idle_connections if conn.is_connected())  # Count idle connections that are still connected
+    total_connections = pool.pool_size
+    return active_connections, total_connections
+
+def delete_chunk(chunk, connection):
+    cursor = connection.cursor()
     delete_query = f"""delete from {table} where sale_order_id in {chunk}"""
     cursor.execute(delete_query)
-    DESTINATION_CONNECTION.commit()
+    cursor.close()
 
-def fetch_chunk(chunk):
+def fetch_chunk(chunk, connection):
     q = f"""
         SELECT 
             /* sale order item details */
@@ -76,7 +105,12 @@ def fetch_chunk(chunk):
             so.state AS order_state,
     
             /* Product Details */
-            t.name AS title_name,
+            (
+                CASE
+                    WHEN cb.id IS NULL AND t.name IS NOT NULL THEN t.name
+                    WHEN cb.id IS NOT NULL THEN cb.name
+                END
+            ) AS title_name,
             e.name AS edition_name,
             ept.ref_code,
             mtt.name AS master_title_type,
@@ -85,6 +119,7 @@ def fetch_chunk(chunk):
                 CASE
                     WHEN soi.itemParentable_type LIKE "%StandardMetaData" THEN smd.abbr
                     WHEN soi.itemParentable_type LIKE "%NotebookTitleDetail" THEN "Notebook"
+                    WHEN cb.id IS NOT NULL THEN smd2.abbr
                     ELSE NULL
                 END
             ) AS meta_data,
@@ -121,6 +156,7 @@ def fetch_chunk(chunk):
             so.contactable_type,
             so.contactable_id,
             c.billing_name AS customer_name,
+            crs.name as customer_category,
             so.billing_address, 
             
             /* RSM */
@@ -132,13 +168,13 @@ def fetch_chunk(chunk):
     
             /* TAT */
             s_tat.packed_2_delivered_tat_day,
-            s_tat.packed_2_delivered_tat_minutes,
+            /* s_tat.packed_2_delivered_tat_minutes, */
             so_tat.create_2_processing_tat_day,
-            so_tat.create_2_processing_tat_minutes,
+            /* so_tat.create_2_processing_tat_minutes, */
             so_tat.processing_2_complete_tat_day,
-            so_tat.processing_2_complete_tat_minutes,
+            /* so_tat.processing_2_complete_tat_minutes, */
             
-            now() as fetch_date
+            now() as fetch_date /* DATE_ADD(NOW(), INTERVAL '5:30' HOUR_MINUTE) */
     
         /* Sale Order and Invoice Items Tables */
         FROM sale_order_items as soi 
@@ -177,8 +213,8 @@ def fetch_chunk(chunk):
         LEFT JOIN ( 
             SELECT 
                 s.sale_order_id, 
-                MIN(DATEDIFF(sl2.created_at, sl1.created_at)) AS packed_2_delivered_tat_day, 
-                MIN(TIMEDIFF(sl2.created_at, sl1.created_at)) AS packed_2_delivered_tat_minutes 
+                MIN(DATEDIFF(sl2.created_at, sl1.created_at)) AS packed_2_delivered_tat_day 
+                /* MIN(TIMEDIFF(sl2.created_at, sl1.created_at)) AS packed_2_delivered_tat_minutes  */
             FROM shipments AS s 
             LEFT JOIN shipment_state_logs AS sl1 ON sl1.shipment_id = s.id AND sl1.state LIKE "PACKED" 
             LEFT JOIN shipment_state_logs AS sl2 ON sl2.shipment_id = s.id AND sl2.state LIKE "DELIVERED" 
@@ -191,9 +227,9 @@ def fetch_chunk(chunk):
             SELECT 
                 so.id as sale_order_id, 
                 MIN(DATEDIFF(c2p2.created_at,c2p1.created_at)) as create_2_processing_tat_day, 
-                MIN(TIMEDIFF(c2p2.created_at, c2p1.created_at)) as create_2_processing_tat_minutes, 
-                MIN(DATEDIFF(p2c2.created_at,p2c1.created_at)) as processing_2_complete_tat_day, 
-                MIN(TIMEDIFF(p2c2.created_at, p2c1.created_at)) as processing_2_complete_tat_minutes
+                /* MIN(TIMEDIFF(c2p2.created_at, c2p1.created_at)) as create_2_processing_tat_minutes, */
+                MIN(DATEDIFF(p2c2.created_at,p2c1.created_at)) as processing_2_complete_tat_day 
+                /* MIN(TIMEDIFF(p2c2.created_at, p2c1.created_at)) as processing_2_complete_tat_minutes */
             FROM sale_orders as so 
             left join sale_order_state_logs as c2p1 on c2p1.sale_order_id = so.id and c2p1.state in ("CREATED")
             left join sale_order_state_logs as c2p2 on c2p2.sale_order_id = so.id and c2p2.state in ("SEND_FOR_DIGITAL", "PROCESSED")
@@ -211,6 +247,8 @@ def fetch_chunk(chunk):
         LEFT JOIN master_title_sub_types as mtst on mtst.id = t.master_title_sub_type_id
         LEFT JOIN standard_meta_data as smd on smd.id = soi.itemParentable_id AND soi.itemParentable_type LIKE "%StandardMetaData" AND soi.saleable_type like "%EditionProductType"
         LEFT JOIN notebook_title_details as ntd on ntd.id = soi.itemParentable_id and soi.itemParentable_type LIKE "%NotebookTitleDetail"
+        LEFT JOIN customized_books as cb on cb.id = soi.saleable_id and soi.saleable_type LIKE "%CustomizedBook"
+        LEFT JOIN standard_meta_data as smd2 on smd2.id = cb.standard_meta_data_id
     
         /* RSM Tables */
         LEFT JOIN branches as b on so.branch_id = b.id
@@ -219,12 +257,13 @@ def fetch_chunk(chunk):
         LEFT JOIN contact_individual_details as cid on cid.contact_id = emp.contact_id
     
         /* Customer Tables */
-        LEFT JOIN customers as c on c.id = so.contactable_id AND so.contactable_type LIKE "%Customer" 
+        LEFT JOIN customers as c on c.id = so.contactable_id AND so.contactable_type LIKE "%Customer"
+        LEFT JOIN c_roles as crs on crs.id = c.role_id
     
         /* Filters Tables */
         WHERE ( soi.saleable_type LIKE "%EditionProductType"  ) AND ( so.state in ("PARTIAL_COMPLETED", "COMPLETED", "FORCED_COMPLETED", "CANCELLED")) AND so.id in {chunk}
         """
-    df = pd.read_sql_query(q, SOURCE_CONNECTION)
+    df = pd.read_sql_query(q, connection)
     return(df)
 
 def data_transform(df):
@@ -269,16 +308,15 @@ def data_transform(df):
             'is_invoiced', 'invoice_id', 'invoice_prefix', 'invoice_is_bill',
             'invoice_cr_dr_state', 'invoice_state', 'invoice_round_off',
             'invoice_date', 'invoice_total_with_tax',
-            'total_unit_price_without_tax', 'advance_amount', 'contactable_type',
+            'total_unit_price_without_tax', 'advance_amount', 'cash_amount', 'cheque_amount', 'online_amount', 'contactable_type',
             'sales_group_id', 'sales_group_name', 'rsm',
-            'contactable_id', 'customer_name', 'branch_id', 'branch_name','address_city', 'address_pincode', 'address_state', 
-            'packed_2_delivered_tat_day', 'packed_2_delivered_tat_minutes', 'create_2_processing_tat_day','create_2_processing_tat_minutes',
-            'processing_2_complete_tat_day', 'processing_2_complete_tat_minutes', 'fetch_date']]
+            'contactable_id', 'customer_name', 'customer_category', 'branch_id', 'branch_name','address_city', 'address_pincode', 'address_state', 
+            'packed_2_delivered_tat_day', 'create_2_processing_tat_day', 'processing_2_complete_tat_day', 'fetch_date']]
     df = df.applymap(lambda x: x.item() if isinstance(x, np.generic) else x)
     return df
 
-def load_data(df):
-    mycursor = DESTINATION_CONNECTION.cursor()
+def load_data(df, connection):
+    mycursor = connection.cursor()
     load_chunk_size = int(conf.get("app", "load_chunk_size"))
     row_count = df.shape[0]
     load_counter = 1
@@ -286,21 +324,20 @@ def load_data(df):
         row = df.iloc[i]
         row = row.apply(lambda x: x.item() if isinstance(x, np.generic) else x)
         row = row.replace({np.nan: None})
-        query = f"""
-        insert into {table} (sale_order_item_id,itemParentable_type,itemParentable_id,saleable_type,saleable_id,sale_order_item_discount_percentage,sale_order_item_mrp,unit_price_with_tax,unit_price_without_tax,cgst_tax_rate,sgst_tax_rate,igst_tax_rate,cgst_tax_amount,sgst_tax_amount,igst_tax_amount,is_dc,sale_order_id,sale_order_date,sale_order_net_total,sales_channel,order_state,title_name,edition_name,ref_code,master_title_type,master_title_sub_type,meta_data,invoice_item_id,quantity,ii_quantity,final_ii_quantity,is_both_invoiced,is_partially_invoiced,non_invoiced_quantity,invoice_item_is_bill,invoice_item_is_dc,is_invoiced,invoice_id,invoice_prefix,invoice_is_bill,invoice_cr_dr_state,invoice_state,invoice_round_off,invoice_date,invoice_total_with_tax,total_unit_price_without_tax,advance_amount,contactable_type,sales_group_id,sales_group_name,rsm,contactable_id,customer_name,branch_id,branch_name,address_city,address_pincode,address_state,packed_2_delivered_tat_day,create_2_processing_tat_day,processing_2_complete_tat_day,fetch_date) 
-        values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """
+        query = f"""insert into {table} (sale_order_item_id,itemParentable_type,itemParentable_id,saleable_type,saleable_id,sale_order_item_discount_percentage,sale_order_item_mrp,unit_price_with_tax,unit_price_without_tax,cgst_tax_rate,sgst_tax_rate,igst_tax_rate,cgst_tax_amount,sgst_tax_amount,igst_tax_amount,is_dc,sale_order_id,sale_order_date,sale_order_net_total,sales_channel,order_state,title_name,edition_name,ref_code,master_title_type,master_title_sub_type,meta_data,invoice_item_id,quantity,ii_quantity,final_ii_quantity,is_both_invoiced,is_partially_invoiced,non_invoiced_quantity,invoice_item_is_bill,invoice_item_is_dc,is_invoiced,invoice_id,invoice_prefix,invoice_is_bill,invoice_cr_dr_state,invoice_state,invoice_round_off,invoice_date,invoice_total_with_tax,total_unit_price_without_tax,advance_amount,cash_amount,cheque_amount,online_amount,contactable_type,sales_group_id,sales_group_name,rsm,contactable_id,customer_name,customer_category,branch_id,branch_name,address_city,address_pincode,address_state,packed_2_delivered_tat_day,create_2_processing_tat_day,processing_2_complete_tat_day,fetch_date) 
+            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """
         mycursor.execute(query, 
             (
-                row['sale_order_item_id'], row['itemParentable_type'], row['itemParentable_id'], row['saleable_type'], row['saleable_id'], row['sale_order_item_discount_percentage'], row['sale_order_item_mrp'], row['unit_price_with_tax'], row['unit_price_without_tax'], row['cgst_tax_rate'], row['sgst_tax_rate'], row['igst_tax_rate'], row['cgst_tax_amount'], row['sgst_tax_amount'], row['igst_tax_amount'], row['is_dc'], row['sale_order_id'], row['sale_order_date'], row['sale_order_net_total'], row['sales_channel'], row['order_state'], row['title_name'], row['edition_name'], row['ref_code'], row['master_title_type'], row['master_title_sub_type'], row['meta_data'], row['invoice_item_id'], row['quantity'], row['ii_quantity'], row['final_ii_quantity'], row['is_both_invoiced'], row['is_partially_invoiced'], row['non_invoiced_quantity'], row['invoice_item_is_bill'], row['invoice_item_is_dc'], row['is_invoiced'], row['invoice_id'], row['invoice_prefix'], row['invoice_is_bill'], row['invoice_cr_dr_state'], row['invoice_state'], row['invoice_round_off'], row['invoice_date'], row['invoice_total_with_tax'], row['total_unit_price_without_tax'], row['advance_amount'], row['contactable_type'], row['sales_group_id'], row['sales_group_name'], row['rsm'], row['contactable_id'], row['customer_name'], row['branch_id'], row['branch_name'], row['address_city'], row['address_pincode'], row['address_state'], row['packed_2_delivered_tat_day'], row['create_2_processing_tat_day'], row['processing_2_complete_tat_day'] , row['fetch_date']    
+                row['sale_order_item_id'], row['itemParentable_type'], row['itemParentable_id'], row['saleable_type'], row['saleable_id'], row['sale_order_item_discount_percentage'], row['sale_order_item_mrp'], row['unit_price_with_tax'], row['unit_price_without_tax'], row['cgst_tax_rate'], row['sgst_tax_rate'], row['igst_tax_rate'], row['cgst_tax_amount'], row['sgst_tax_amount'], row['igst_tax_amount'], row['is_dc'], row['sale_order_id'], row['sale_order_date'], row['sale_order_net_total'], row['sales_channel'], row['order_state'], row['title_name'], row['edition_name'], row['ref_code'], row['master_title_type'], row['master_title_sub_type'], row['meta_data'], row['invoice_item_id'], row['quantity'], row['ii_quantity'], row['final_ii_quantity'], row['is_both_invoiced'], row['is_partially_invoiced'], row['non_invoiced_quantity'], row['invoice_item_is_bill'], row['invoice_item_is_dc'], row['is_invoiced'], row['invoice_id'], row['invoice_prefix'], row['invoice_is_bill'], row['invoice_cr_dr_state'], row['invoice_state'], row['invoice_round_off'], row['invoice_date'], row['invoice_total_with_tax'], row['total_unit_price_without_tax'], row['advance_amount'], row['cash_amount'], row['cheque_amount'], row['online_amount'], row['contactable_type'], row['sales_group_id'], row['sales_group_name'], row['rsm'], row['contactable_id'], row['customer_name'], row['customer_category'], row['branch_id'], row['branch_name'], row['address_city'], row['address_pincode'], row['address_state'], row['packed_2_delivered_tat_day'], row['create_2_processing_tat_day'], row['processing_2_complete_tat_day'], row['fetch_date']
             )
         )
-        if load_counter >= load_chunk_size :
-            DESTINATION_CONNECTION.commit()
-            load_counter = 0
-        load_counter += 1
-    if row_count % load_chunk_size != 0:
-        DESTINATION_CONNECTION.commit()
+    #     if load_counter >= load_chunk_size :
+    #         connection.commit()
+    #         load_counter = 0
+    #     load_counter += 1
+    # if row_count % load_chunk_size != 0:
+    #     connection.commit()
 
 def processing(counter, chunk):
     start_time = time.time()
@@ -308,22 +345,47 @@ def processing(counter, chunk):
     conf.set("app", "last_chunk_in_processing", str(counter))
     with open("./configure.yaml", "w") as config_file:
         conf.write(config_file)
-    logging.info(f"Chunk no: {counter} deletion started")
-    delete_chunk(chunk)
-    logging.info(f"Chunk no: {counter} deletion done")
+
+    ############################################################## Fetching 
     logging.info(f"Chunk no: {counter} data fetch started")
-    fetched_data = fetch_chunk(chunk)
+    try:
+        source_connection = connection_pool_source.get_connection()
+        fetched_data = fetch_chunk(chunk, source_connection)
+    except Exception as e:
+        logging.warn(f"Failed chunk fetching for {counter} chunk : {e}") 
+        if 'source_connection' in locals():
+            source_connection.rollback()
+    finally:
+        if 'source_connection' in locals():
+            source_connection.close()
     logging.info(f"Chunk no: {counter} data fetch done")    
+
+    ############################################################## Transformation 
     logging.info(f"Chunk no: {counter} transformation started")
     transformed_data = data_transform(fetched_data)
     logging.info(f"Chunk no: {counter} transformation done")
+
+    ############################################################## Loading 
     logging.info(f"Chunk no: {counter} loading started")
-    load_data(transformed_data)
+    try:
+        destination_connection = connection_pool_destination.get_connection()
+        load_data(transformed_data, destination_connection)
+        destination_connection.commit()
+    except Exception as e:
+        logging.warn(f"Failed Loading for {counter} chunk : {e}")
+        if 'destination_connection' in locals():
+            destination_connection.rollback()
+        logging.info(f"Chunk No: {counter} Retrying")
+        processing(counter, chunk)
+    finally:
+        if 'destination_connection' in locals():
+            destination_connection.close()
     logging.info(f"Chunk no: {counter} loading done")
     end_time = time.time() 
     logging.info(f"Chunk no: {counter} completion time {end_time - start_time}")
 
 def synch(date):
+    source_connection = connection_pool_source.get_connection()
     synchs = ["created_at", "updated_at"]
     new_sale_orders = []
     updated_sale_orders = []
@@ -455,54 +517,72 @@ def synch(date):
         
         if synch_type == "created_at":
             q = s1 + s2 + s3 + s4 + s5
-            new_sale_orders = list( pd.read_sql_query(q, SOURCE_CONNECTION).sale_order_id.values )
+            new_sale_orders = list( pd.read_sql_query(q, source_connection).sale_order_id.values )
         else:
             q = s1 + s3 + s5
-            updated_sale_orders = list( pd.read_sql_query(q, SOURCE_CONNECTION).sale_order_id.values )
+            updated_sale_orders = list( pd.read_sql_query(q, source_connection).sale_order_id.values )
         logging.info(f"{synch_type} Synch Done")
+    source_connection.close()
     return set(sorted(list(set(tuple(new_sale_orders) + tuple(updated_sale_orders)))))
 @dag(
-    dag_id= conf.get("app", "dag_id")
+    dag_id= "Regular_orders_threading_prod"
 )
 
 def test():
     @task
     def synch_data():
         logging.info("Synch Started")
-        date = conf.get("app", "last_synch_date")
+        date = conf_state.get("db_state", "last_synch_date")
         synch_ids = synch(date)
         chunk_size = int(conf.get("app", "chunk_size"))
         id_count = len(synch_ids)
         logging.info(f"Synch End | total {id_count} ids found with {math.ceil(id_count/chunk_size)} chunks")
         return synch_ids
+    
+    @task
+    def deletion(ids):
+            logging.info(f"deletion started")
+            try:
+                destination_connection = connection_pool_destination.get_connection()
+                delete_chunk(tuple(ids), destination_connection)
+                destination_connection.commit()
+            except Exception as e:
+                logging.warn(f"Failed Deletion : {e}")
+                if 'destination_connection' in locals():
+                    destination_connection.rollback()
+            finally:
+                if 'destination_connection' in locals():
+                    destination_connection.close()
+            logging.info(f"Deletion done")
+            return ids
 
     @task
     def e_t_l(ids):
         logging.info("Chunking Started")
         ids = tuple(ids)
         chunk_size = int(conf.get("app", "chunk_size"))
-        start_from_last_chunk = str(conf.get("app", "start_from_last_chunk"))
-        last_chunk_in_processing = int(conf.get("app", "last_chunk_in_processing"))
         counter = 1
-        for i in range(0, len(ids), chunk_size):
-            if start_from_last_chunk == "True" and counter >= last_chunk_in_processing - 1 :
+        logging.info(f"Total {len(ids) / chunk_size} chunks found")
+        future_to_chunk = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
+            for i in range(0, len(ids), chunk_size):
                 chunk = ids[i:i+chunk_size]
-                processing(counter, chunk)
-            else:
-                chunk = ids[i:i+chunk_size]
-                processing(counter, chunk)
-            counter += 1
+                future = executor.submit(processing, counter, chunk)
+                future_to_chunk[future] = chunk
+                counter += 1
         return True
 
     @task
     def save_state(state):
         if state == True:
-            conf.set("app", "last_synch_date", str(datetime.now()))
-            with open("./configure.yaml", "w") as config_file:
-                conf.write(config_file)
+            conf_state.set("db_state", "last_synch_date", str(datetime.now()))
+            with open("./db_state.yaml", "w") as config_file:
+                conf_state.write(config_file)
+        return True
 
     synched_ids = synch_data()
-    state = e_t_l(synched_ids)
+    deleted_ids = deletion(synched_ids)
+    state = e_t_l(deleted_ids)
     save_state(state)
 
 test()
